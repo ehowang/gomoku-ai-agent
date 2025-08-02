@@ -1,0 +1,6 @@
+{
+    "name": "ExampleAgent",
+    "agent_class": "my_example.MyExampleAgent",
+    "author": "Claude",
+    "description": "This is a simple agent"
+}

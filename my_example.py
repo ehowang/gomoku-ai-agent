@@ -1,10 +1,12 @@
 # Import necessary modules for regular expressions, JSON parsing, and the Gomoku framework
+import os
 import re
 import json
 from gomoku import Agent
 from gomoku.llm import OpenAIGomokuClient
 from gomoku.core.models import Player
-
+from dotenv import load_dotenv
+load_dotenv()
 
 class MyExampleAgent(Agent):
     """
@@ -18,7 +20,20 @@ class MyExampleAgent(Agent):
         This method is called once when the agent is created.
         """
         # Create an OpenAI-compatible client using the Gemma2 model for move generation
-        self.llm = OpenAIGomokuClient(model="gemma2-9b-it")
+        self.llm = OpenAIGomokuClient(
+            model="qwen/qwen3-8b",
+            api_key=os.getenv("PROF_API_KEY"),
+            endpoint=os.getenv("PROF_BASE_URL"),
+        )
+    def _create_system_prompt(self,player,rival) -> str:
+        """Create the system prompt that teaches the LLM how to play Gomoku."""
+        return """
+You are a Gomoku move selector.
+Think silently and do not reveal your reasoning.
+Return only a single JSON object with two integer fields: "row" and "col".
+Never include any other text, explanations, tags, or code fences.
+""".strip()
+    
 
     async def get_move(self, game_state):
         """
@@ -36,48 +51,95 @@ class MyExampleAgent(Agent):
         # Determine the opponent's symbol by checking which player we are
         rival = (Player.WHITE if self.player == Player.BLACK else Player.BLACK).value
 
-        # Convert the game board to a human-readable string format
-        board_str = game_state.format_board("standard")
+        # Convert the game board to JSON string and gather legal moves
+        board_str = game_state.format_board("json")
         board_size = game_state.board_size
+        legal_moves = game_state.get_legal_moves()
+        # Ensure JSON-serializable list of [row, col]
+        legal_moves_list = [[r, c] for (r, c) in legal_moves]
 
         # Prepare the conversation messages for the language model
         messages = [
             {
                 "role": "system",
-                "content": f"You are a professional Gomoku (5-in-a-row) player. You are playing as {player}, and your opponent is {rival}. Your task is to examine the current 8x8 board and select the best next move to increase your chances of winning. Aim for a strategic advantage or to block your opponent if necessary.",
+                "content": self._create_system_prompt(player,rival),
             },
             {
                 "role": "user",
-                "content": f"""Here is the current board. The grid is {board_size}x{board_size}, with row and column indices labeled. Cells contain:
-- "." for empty
-- "{player}" for your stones
-- "{rival}" for opponent's stones
+                "content": f"""You are {player}. Opponent is {rival}. Grid is {board_size}x{board_size} with 0-based indices.
 
+Board (JSON):
 {board_str}
 
-Respond with the best next move using this exact JSON format (no explanation):
+Legal moves (choose exactly one pair from this list):
+{json.dumps(legal_moves_list)}
 
-{{ "row": <row_number>, "col": <col_number> }}""",
+Priorities:
+1) If you can win in one move this turn, play that move.
+2) Else, if the opponent can win on their next turn, block that move.
+3) Else, extend/defend your longest line, preferring central positions and adjacency to your stones.
+
+Output exactly one line, JSON only, no other text:
+{{"row": <int>, "col": <int>}}""",
             },
         ]
 
         # Send the messages to the language model and get the response
         content = await self.llm.complete(messages)
 
-        # Parse the LLM response to extract move coordinates
-        try:
-            # Use regex to find JSON-like content in the response
-            if m := re.search(r"{[^}]+}", content, re.DOTALL):
-                # Parse the JSON to extract row and column
-                move = json.loads(m.group(0))
-                row, col = (move["row"], move["col"])
+        # Helpers
+        def parse_last_row_col_pair(text: str):
+            pattern = r'\{\s*"row"\s*:\s*-?\d+\s*,\s*"col"\s*:\s*-?\d+\s*\}'
+            matches = re.findall(pattern, text, flags=re.DOTALL)
+            if not matches:
+                return None
+            try:
+                obj = json.loads(matches[-1])
+                return int(obj["row"]), int(obj["col"])
+            except Exception:
+                return None
 
-                # Validate that the proposed move is legal
-                if game_state.is_valid_move(row, col):
-                    return (row, col)
-        except json.JSONDecodeError as e:
-            # If JSON parsing fails, continue to fallback strategy
-            pass
+        legal_moves_set = {(r, c) for (r, c) in legal_moves}
 
-        # Fallback: if LLM response is invalid, choose the first available legal move
-        return game_state.get_legal_moves()[0]
+        # Try to parse and validate the first response
+        parsed = parse_last_row_col_pair(content)
+        if parsed is not None:
+            row, col = parsed
+            if (row, col) in legal_moves_set and game_state.is_valid_move(row, col):
+                return (row, col)
+
+        # One repair attempt if invalid or unparsable
+        repair_messages = [
+            {
+                "role": "system",
+                "content": self._create_system_prompt(player, rival),
+            },
+            {
+                "role": "user",
+                "content": f"""Your previous selection was invalid.
+Choose exactly one pair from these legal moves and return JSON only:
+{json.dumps(legal_moves_list)}
+
+Output exactly: {{"row": <int>, "col": <int>}}""",
+            },
+        ]
+        content2 = await self.llm.complete(repair_messages)
+        parsed2 = parse_last_row_col_pair(content2)
+        if parsed2 is not None:
+            row2, col2 = parsed2
+            if (row2, col2) in legal_moves_set and game_state.is_valid_move(row2, col2):
+                return (row2, col2)
+
+        # Smarter fallback: choose center-most legal move
+        if not legal_moves:
+            # No legal moves available (shouldn't happen during a move request)
+            return game_state.get_legal_moves()[0]
+
+        center_row = (board_size - 1) / 2.0
+        center_col = (board_size - 1) / 2.0
+        def center_distance(move):
+            r, c = move
+            return abs(r - center_row) + abs(c - center_col)
+
+        best_move = min(legal_moves, key=center_distance)
+        return best_move

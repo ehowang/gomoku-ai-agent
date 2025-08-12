@@ -1,6 +1,6 @@
 {
-    "name": "ExampleAgent",
+    "name": "my_example",
     "agent_class": "my_example.MyExampleAgent",
-    "author": "Claude",
+    "author": "me",
     "description": "This is a simple agent"
 }
